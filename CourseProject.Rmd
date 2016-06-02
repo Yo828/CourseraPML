@@ -1,0 +1,224 @@
+---
+title: "Practical Machine Learning"
+author: "Johan van der Watt"
+date: "2 June 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load all the required libraries up front
+library(readr)
+library(caret)
+library(MASS)
+library(randomForest)
+library(dplyr)
+```
+## Synopsis
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict the manner in which they did the exercise. 
+
+The data from this project is sourced from <http://groupware.les.inf.puc-rio.br/har> and it includes the observed manner in which they did the exercise in a variable called __classe__  
+
+This project compared a number of models on the training data and concluded that the Random Forest algorithm provided the most accurate predictions.  
+
+
+## Loading the data  
+Training data is sourced from <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>
+```{r cache=TRUE, warning=FALSE}
+#Check to see if file has been downloaded in \data sub folder. If not, read directly from URL
+fTrainLocal <- paste(getwd(),"/data/pml-training.csv",sep="") 
+fTrainURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+
+if (file.exists(fTrainLocal)) 
+    {raw.train <- read_csv(fTrainLocal)} else
+    {raw.train <- read_csv(fTrainURL)} 
+
+```
+## Preparing the data
+We will have a quick look at the data to see if we need to keep all the variables, rename columns or manipulate values if required and gather any information we can use for our modelling.  
+
+First let's see how many rows and columns we have.  
+```{r}
+dim(raw.train)
+```
+That's a large number of rows (which means we can happily create a model building, as well as a validation data set) but also a very large number of variables. The following R tools have been used to investigate the dataset, but the output has been hidden (using `results='hide'` in r chunk options) to keep this document to a reasonable size.  
+'
+```{r results='hide'}
+# Look at variable names, classes and first few values
+str(raw.train)
+# Look at variable scale, range, NAs or 0's, etc.
+summary(raw.train)
+# Look at the data in a table format to get a better feel for it
+View(raw.train[1000:1500,]) #just pick 500 rows not at start or end
+```
+We note that  
+
+- The __first column__ doesn't have a name. The data in this column indicates that it's just a sequence number for the reords. _(we'll give this column a name, but will exclude it when we train our model)_  
+- columns 2 through 7 (__user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window__) are describing the data row but are not valuable as predictive features _(we'll exclude these when we train our model)_
+- The __classe__ variable (the observed outcome variable) is the last column and its class character,  _(we will remember this for our modelling and also change it's class to a factor)_  
+- A number of variables have NA values _(we will investigate these further)_   
+- There are a large numer of calculated variable names (min, max, avg, etc.). Looking at the datasource (website), we learn that 96 features have been derived:
+
+    "For the Euler angles of each of the four sensors we calculated eight features: __mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness__, generating in total 96 derived feature sets." - the Euler angles are "roll", "pitch" and "yaw".  
+    
+    There are actually four additional variance variables related to acceleration that falls in this same category.
+_(we will remove the 96 +4 variables that relate to calculated features as these are actually part of the original scientists' model. Our model will be built on the raw data only)_  
+
+```{r}
+#Let's first remove the columns for those 8 calculated features. We'll create a new data.frame
+pre.train <- dplyr::select (raw.train, -starts_with("avg_"), -starts_with("var_"),
+                          -starts_with("stddev_"),-starts_with("max_"), 
+                          -starts_with("min_"),-starts_with("amplitude_"),
+                          -starts_with("kurtosis_"),-starts_with("skewness_"))
+
+#Let's give the first column a name
+colnames(pre.train)[1]<-"sequence_number"
+
+#And make the outcome variable a factor
+pre.train$classe <- as.factor(pre.train$classe)
+
+# Now let's get a feel for those NA values
+c(nrow(pre.train),sum(!complete.cases(pre.train)))
+```
+This indicates that there's only 1 row out of 19,622 that does not have a full set of variable values. This is insignificant so we will discard the row instead of trying to impute any missing values.
+```{r}
+#discard the incomplete row
+pre.train<-pre.train[complete.cases(pre.train),]
+dim(pre.train)
+```
+
+## Create building and validation data
+We noted a large number of rows (19621) in our prepared dataset. This means we have the luxury of splitting this dataset into a __building__ data set (which we will use to build our predictive model) and a __validation__ data set which we can use to validate our model to determine how accurate it is on previously unseen data (not used t train with).  
+
+We're setting a seed variable that we will use prior to any random selection methods to make this project reproducible.  
+
+```{r}
+seed <- 828 # this seed variable will be used later
+```
+Create the building and validation data sets  
+
+```{r}
+# set the seed
+set.seed(seed)
+
+#Include 75% of the prepared dataset in the model building data set, and 25% in the validation set
+inBuild<-createDataPartition(pre.train$classe,p=0.75,list = FALSE)
+building <- pre.train[inBuild,]
+validation <- pre.train[-inBuild,]
+
+#How many records in our building dataset?
+nrow(building) 
+
+#And how many records in each classe? 
+table(building$classe)
+```
+The above shows that we have a large number of records in each classe which is good for training our model.
+
+#Exploring the data
+The goal of this section is to learn something about the distribution, central tendency and spread of each variable.This will help us decide on the type of model to train.  
+```{r results='hide'}
+# The DescTools package is very handy for this
+library(DescTools)
+
+#set options to make output more readable
+options(digits=3, scipen = 1000)
+
+#Describe and optionally plot variable detials
+Desc(building[,8:60], plotit=FALSE) #set plotit to TRUE for insightful charts
+```
+The above will describe all the training variables as well as the outcome variable. This output has been hidden from this repoirt, but we note that  
+
+- a number of variables are almost normally distributed, e.g. __total_accel_forearm__     
+- a number of variabes have a double gaussian distribution curve, e.g. __accel_belt_z__    
+- a number of variables are skewed, e.g. __magnet_belt_y__   
+
+```{r fig.width=4,fig.height=3, results='hide'}
+Desc(building$total_accel_forearm, plotit=TRUE)
+Desc(building$accel_belt_z, plotit=TRUE)
+Desc(building$magnet_belt_y, plotit=TRUE)
+
+```
+   
+## Training the model
+
+Based on the large number of variables and the different characterisrtics of them, three linear and non-linear models will be trained and then compared. Data will be standardised (centred and scaled) and normalised for models where it is appropriate.  
+
+The model types selected for training are   
+
+- Linear Discriminant Analysis (LDA) (__linear__)  
+- k-Nearest Neighbors (KNN) (__non-linear__)  
+- Random Forest (RF) (__complex non-linear__)  
+
+k-fold __cross-validation__ is done (with the number of folds set to 5) to calculate the estimated accuracy of the models.  
+ 
+The same seed will be set before each model is tained to ensure that random sampling is consistent for all the models.  
+
+```{r cache=TRUE}
+#set up k-fold cross validation to measure accuracy
+
+trainControl <- trainControl(method="cv", number=5)
+metric <- "Accuracy"
+
+# The training dataset contains only the predictor and outcomce variables identified
+training<-building[,8:60]
+
+# LDA
+set.seed(seed)
+fit.lda <- train(classe~., data=training, method="lda", preProc=c("center", "scale"),metric=metric, trControl=trainControl)
+# KNN
+set.seed(seed)
+fit.knn <- train(classe~., data=training, method="knn", preProc=c("center", "scale"), metric=metric, trControl=trainControl)
+# RF
+set.seed(seed)
+fit.rf <- train(classe~., data=training, method="rf", prox=TRUE, metric=metric, trControl=trainControl)
+```
+Now we compare the results of these models ot pick our best model. The __resamples__ function gathers the results of the 5 k-fold cross-validation samples for each model.   
+```{r}
+# summarize accuracy of models
+results <- resamples(list(LDA=fit.lda, KNN=fit.knn, RF=fit.rf))
+summary(results)
+```
+The above indicates that the Random Forest (RF) model outperformed the other models with accuracy as the metric. Let's look at the final model, with an average accuracy of 99.1%.  
+```{r}
+fit.rf$finalModel
+```
+With 5-fold cross-validation performed in model training, we expect a very small out of sample error of 0.73%
+
+## Validation
+
+Now that we have picked the best model, let's try it out on previously unseen (by training algorithm) data, namely our validation dataset that we kept aside earlier
+```{r}
+# try our winning model on validation dataset (without the outcome variable)
+pred.validation <- predict(fit.rf, validation[,-60])
+
+#and let's see how we did
+confusionMatrix(pred.validation, validation$classe)
+```
+Our accuracy on the validation data is 99.3% with a 95% confidence interval of 99.1%-99.6%. This is pretty high and we are confident that our model will fare well.
+
+## Prediction
+
+We will now use our model to predict the data in the test set for this project. Let's first load the data.
+
+Test data is sourced from <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv>
+```{r cache=TRUE, warning=FALSE}
+#Check to see if file has been downloaded in \data sub folder. If not, read directly from URL
+fTestLocal <- paste(getwd(),"/data/pml-testing.csv",sep="") 
+fTestURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+if (file.exists(fTestLocal)) 
+    {testing <- read_csv(fTestLocal)} else
+    {testing <- read_csv(fTestURL)} 
+```
+
+And without peeking at the data, let's predict the outcome with our best (RF) trained model
+```{r}
+# predict testing data outcomes
+pred.test <- predict(fit.rf, testing)
+
+#Let's see the outcomes
+table(pred.test)
+```
+
+
